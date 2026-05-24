@@ -5,11 +5,16 @@
 #include "MAX30105.h"
 #include "heartRate.h"
 
-// wifi dan password untuk esp dan device pemantau
+// wifi dan password
 const char* ssid = "xxxx";     
 const char* pass = "xxxx";
 
-String textmebotApikey = "xxxx"; // Ganti dengan API Key dari TextMeBot
+// IPSTATIS
+IPAddress local_IP(x,x,x,x); 
+IPAddress gateway(x,x,x,x);    
+IPAddress subnet(x,x,x,x);
+
+String textmebotApikey = "xxxx"; // APIkeytextmebot
 String targetNomor = "+xxxx"; 
 
 #define I2C_SDA 8
@@ -36,6 +41,10 @@ int ambangBahayaGas = 1500;
 unsigned long prevTimeMPU = 0, prevTimeSerial = 0;
 unsigned long timeLyingDownStart = 0;
 unsigned long lastWaSentTime = 0;
+
+// antispam whatsapp
+String lastSentMsg = "Aman"; 
+const unsigned long WA_COOLDOWN = 15000; 
 
 bool isLyingDown = false;
 bool fallEventDetected = false;
@@ -65,6 +74,11 @@ const char* htmlPage PROGMEM = R"rawliteral(
     .modal { display: none; position: fixed; z-index: 1; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.6); }
     .modal-content { background-color: #fff; margin: 15% auto; padding: 20px; border: 1px solid #888; width: 80%; border-radius: 10px; text-align: center;}
     .close-btn { background: red; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 15px;}
+    
+    /* Tombol Manual WA */
+    .btn-manual { background-color: #008CBA; color: white; padding: 12px 20px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-top: 15px; font-weight: bold; width: 100%; transition: 0.3s; }
+    .btn-manual:hover { background-color: #005f7a; }
+    .status-wa { font-size: 14px; margin-top: 10px; font-weight: bold; }
   </style>
 </head>
 <body>
@@ -72,6 +86,9 @@ const char* htmlPage PROGMEM = R"rawliteral(
   <h2>SafeVest Real-Time Monitor</h2>
   <div class="card" id="statusCard">
     <h3>Status Peringatan: <span id="statusText">Memuat...</span></h3>
+    
+    <button class="btn-manual" onclick="sendManualWa()">&#128222; Kirim WA Manual (Backup)</button>
+    <div id="waStatus" class="status-wa"></div>
   </div>
 
   <div class="card">
@@ -120,6 +137,26 @@ const char* htmlPage PROGMEM = R"rawliteral(
   function closeModal() {
     document.getElementById('alertModal').style.display = "none";
   }
+
+  // --- FITUR BARU: JS Fungsi Tombol WA ---
+  function sendManualWa() {
+    let statusLabel = document.getElementById('waStatus');
+    statusLabel.style.color = "blue";
+    statusLabel.innerText = "Mengirim perintah ke ESP32...";
+    
+    fetch('/kirim-wa-manual')
+      .then(response => response.text())
+      .then(data => {
+        statusLabel.style.color = "green";
+        statusLabel.innerText = data;
+        setTimeout(() => { statusLabel.innerText = ""; }, 5000); // Hilang setelah 5 detik
+      })
+      .catch(error => {
+        statusLabel.style.color = "red";
+        statusLabel.innerText = "Gagal! Tidak dapat menghubungi ESP32.";
+      });
+  }
+  // ---------------------------------------
 
   setInterval(function() {
     fetch('/data').then(response => response.json()).then(data => {
@@ -182,28 +219,42 @@ void setup() {
     particleSensor.setPulseAmplitudeIR(0x3C);
     particleSensor.setPulseAmplitudeGreen(0);
   }
+  
+  delay(3000);
 
   WiFi.mode(WIFI_STA);
+  
+  // IP Statis dimatikan sementara, silakan nyalakan jika jaringan cocok
+  // if (!WiFi.config(local_IP, gateway, subnet)) {
+  //   Serial.println("Peringatan: Gagal mengatur IP Statis!");
+  // }
+  WiFi.setAutoReconnect(true); 
+
   WiFi.begin(ssid, pass);
   Serial.print("Menghubungkan ke WiFi HP");
   
   int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 20) {
+  while (WiFi.status() != WL_CONNECTED && retries < 30) {
     delay(500); Serial.print("."); retries++;
   }
   
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nBerhasil Terhubung!");
-    Serial.print("Masukkan IP Address ini di Browser Laptop: "); 
+    Serial.println("\n=============================================");
+    Serial.println("BERHASIL TERHUBUNG KE WIFI!");
+    Serial.print("Masukkan IP Address ini di Browser Laptop: http://"); 
     Serial.println(WiFi.localIP());  
+    Serial.println("=============================================");
   } else {
-    Serial.println("\nGagal terhubung ke WiFi HP.");
+    Serial.println("\nGagal terhubung ke WiFi HP. Pastikan Hotspot nyala.");
   }
 
+  // Konfigurasi Rute WebServer
   server.on("/", []() {
     server.send(200, "text/html", htmlPage);
   });
   server.on("/data", handleSensorData);
+  server.on("/kirim-wa-manual", handleManualWa); // --- RUTE BARU TOMBOL MANUAL ---
+  
   server.begin();
 }
 
@@ -269,11 +320,7 @@ void loop() {
 
   if (currentMillis - prevTimeSerial >= 100) {
     prevTimeSerial = currentMillis;
-    Serial.print("BPM:"); Serial.print(beatAvg);
-    Serial.print(",Gas:"); Serial.print(gasValue);
-    Serial.print(",Gravitasi:"); Serial.print(total_G);
-    Serial.print(",Roll:"); Serial.print(roll);
-    Serial.print(",Pitch:"); Serial.println(pitch);
+    
   }
 }
 
@@ -319,27 +366,39 @@ void evaluateAlarms() {
     currentAlertMsg = "Aman";
   }
 
-  if (isDanger) digitalWrite(buzzerPin, HIGH);
-  else digitalWrite(buzzerPin, LOW);
+  if (isDanger) {
+    digitalWrite(buzzerPin, HIGH);
+  } else {
+    digitalWrite(buzzerPin, LOW);
+  }
 
-  if (isDanger && (now - lastWaSentTime > 60000)) {
-    sendTextMeBotAlert(currentAlertMsg); // Nama fungsi diubah
+  if (isDanger && (currentAlertMsg != lastSentMsg) && (now - lastWaSentTime > WA_COOLDOWN)) {
+    sendTextMeBotAlert(currentAlertMsg);
     lastWaSentTime = now;
+    lastSentMsg = currentAlertMsg; 
+  }
+  
+  if (!isDanger && lastSentMsg != "Aman") {
+    lastSentMsg = "Aman";
   }
 }
 
-// ngirim pesan Whatsapp
+// ombol kirim pesan manual di web
+void handleManualWa() {
+  String manualMsg = "[TOMBOL MANUAL] Status: " + currentAlertMsg;
+  sendTextMeBotAlert(manualMsg);
+  server.send(200, "text/plain", "Perintah berhasil dieksekusi!");
+}
+
 void sendTextMeBotAlert(String message) {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     
-    //isi pesan
     String fullMessage = "*DARURAT SAFEVEST:*\n" + message;
     fullMessage.replace(" ", "%20");
     fullMessage.replace("\n", "%0A");
 
-    // url textgmebot
-    String url = "http://api.textmebot.com/send.php?apikey=" + textmebotApikey + "&number=" + targetNomor + "&text=" + fullMessage;
+    String url = "http://api.textmebot.com/send.php?apikey=" + textmebotApikey + "&recipient=" + targetNomor + "&text=" + fullMessage;
 
     http.begin(url);
     int httpResponseCode = http.GET();
@@ -354,7 +413,6 @@ void sendTextMeBotAlert(String message) {
   }
 }
 
-// ngirim data dari sensor ke web
 void handleSensorData() {
   String json = "{";
   json += "\"bpm\":" + String(beatAvg) + ",";
